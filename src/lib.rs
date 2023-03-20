@@ -76,42 +76,32 @@ pub mod controller;
 pub mod session;
 
 #[cfg(windows)]
-pub use winapi;
+pub use windows;
 
 use self::controller::Session;
 use std::fmt;
+use thiserror::Error;
 
 /// Service errors
-#[derive(Debug)]
-pub struct Error {
-    pub message: String,
+#[derive(Error, Debug)]
+pub enum Error {
+    #[cfg(windows)]
+    #[error(transparent)]
+    WindowsError(#[from] windows::core::Error),
+
+    #[error("{0}")]
+    GenericMessage(String),
 }
 
 impl From<&str> for Error {
     fn from(message: &str) -> Self {
-        Error {
-            message: message.to_string(),
-        }
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(f, "{}", self.message,)
-    }
-}
-
-impl std::error::Error for Error {
-    fn description(&self) -> &str {
-        &self.message
+        Error::GenericMessage(message.to_owned())
     }
 }
 
 impl Error {
     pub fn new(message: &str) -> Error {
-        Error {
-            message: String::from(message),
-        }
+        Error::GenericMessage(message.to_owned())
     }
 }
 

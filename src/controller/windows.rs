@@ -1,34 +1,44 @@
-use std::ffi::OsStr;
+use std::ffi::{c_void, OsStr};
 use std::iter::once;
 use std::os::windows::ffi::OsStrExt;
-use std::ptr;
 use std::sync::mpsc;
+use std::{ffi, ptr};
 use std::{thread, time};
 
 use widestring::WideCString;
-use winapi::shared::minwindef::*;
-use winapi::shared::winerror::*;
-use winapi::um::errhandlingapi::*;
-use winapi::um::libloaderapi::*;
-use winapi::um::winbase::*;
-use winapi::um::winnt::*;
-use winapi::um::winsvc::*;
-use winapi::um::winuser::*;
-use winapi::{self, STRUCT};
+use windows::core::{PCWSTR, PWSTR};
+use windows::imp::{FormatMessageW, GetLastError, FORMAT_MESSAGE_FROM_SYSTEM};
+use windows::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, MAX_PATH};
+use windows::Win32::Security::SC_HANDLE;
+use windows::Win32::System::Services::{
+    ChangeServiceConfig2W, CloseServiceHandle, ControlService, CreateServiceW, DeleteService,
+    OpenSCManagerW, OpenServiceW, QueryServiceStatus, RegisterServiceCtrlHandlerExW,
+    SetServiceStatus, StartServiceCtrlDispatcherW, StartServiceW, ENUM_SERVICE_TYPE,
+    SC_MANAGER_ALL_ACCESS, SERVICE_ACCEPT_SESSIONCHANGE,
+    SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
+    SERVICE_CONFIG_DESCRIPTION, SERVICE_CONTROL_CONTINUE, SERVICE_CONTROL_PAUSE,
+    SERVICE_CONTROL_SESSIONCHANGE, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP,
+    SERVICE_DESCRIPTIONW, SERVICE_ERROR, SERVICE_ERROR_NORMAL, SERVICE_RUNNING,
+    SERVICE_START_PENDING, SERVICE_START_TYPE, SERVICE_STATUS, SERVICE_STATUS_CURRENT_STATE,
+    SERVICE_STATUS_HANDLE, SERVICE_STOPPED, SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW,
+    SERVICE_WIN32_OWN_PROCESS,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    WTS_CONSOLE_CONNECT, WTS_CONSOLE_DISCONNECT, WTS_REMOTE_CONNECT, WTS_REMOTE_DISCONNECT,
+    WTS_SESSION_LOCK, WTS_SESSION_LOGOFF, WTS_SESSION_LOGON, WTS_SESSION_UNLOCK,
+};
+use windows::Win32::System::RemoteDesktop::WTSSESSION_NOTIFICATION;
+use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 
 use crate::controller::{ControllerInterface, ServiceMainFn};
 use crate::session;
 use crate::Error;
 use crate::ServiceEvent;
 
-static mut SERVICE_CONTROL_HANDLE: SERVICE_STATUS_HANDLE = ptr::null_mut();
+// Default to an invalid Handle
+static mut SERVICE_CONTROL_HANDLE: SERVICE_STATUS_HANDLE = SERVICE_STATUS_HANDLE(-1);
 
-STRUCT! {#[allow(non_snake_case)]
-    struct SERVICE_DESCRIPTION_W {
-    lpDescription: LPWSTR,
-}}
-
-type WindowsServiceMainWrapperFn = extern "system" fn(argc: DWORD, argv: *mut LPWSTR);
+type WindowsServiceMainWrapperFn = extern "system" fn(argc: u32, argv: *mut PWSTR);
 pub type Session = session::Session_<u32>;
 
 struct Service {
@@ -37,7 +47,7 @@ struct Service {
 
 impl Drop for Service {
     fn drop(&mut self) {
-        if !self.handle.is_null() {
+        if !self.handle.is_invalid() {
             unsafe { CloseServiceHandle(self.handle) };
         }
     }
@@ -48,10 +58,10 @@ struct ServiceControlManager {
 }
 
 impl ServiceControlManager {
-    fn open(desired_access: DWORD) -> Result<ServiceControlManager, Error> {
-        let handle = unsafe { OpenSCManagerW(ptr::null_mut(), ptr::null_mut(), desired_access) };
+    fn open(desired_access: u32) -> Result<ServiceControlManager, Error> {
+        let handle = unsafe { OpenSCManagerW(None, None, desired_access)? };
 
-        if handle.is_null() {
+        if handle.is_invalid() {
             Err(Error::new(&format!(
                 "OpenSCManager: {}",
                 get_last_error_text()
@@ -61,16 +71,16 @@ impl ServiceControlManager {
         }
     }
 
-    fn open_service(&self, service_name: &str, desired_access: DWORD) -> Result<Service, Error> {
+    fn open_service(&self, service_name: &str, desired_access: u32) -> Result<Service, Error> {
         let handle = unsafe {
             OpenServiceW(
                 self.handle,
-                get_utf16(service_name).as_ptr(),
+                PCWSTR(get_utf16(service_name).as_ptr()),
                 desired_access,
-            )
+            )?
         };
 
-        if handle.is_null() {
+        if handle.is_invalid() {
             Err(Error::new(&format!(
                 "OpenServiceW: {}",
                 get_last_error_text()
@@ -83,7 +93,7 @@ impl ServiceControlManager {
 
 impl Drop for ServiceControlManager {
     fn drop(&mut self) {
-        if !self.handle.is_null() {
+        if !self.handle.is_invalid() {
             unsafe { CloseServiceHandle(self.handle) };
         }
     }
@@ -94,18 +104,18 @@ pub struct WindowsController {
     pub service_name: String,
     pub display_name: String,
     pub description: String,
-    pub desired_access: DWORD,
-    pub service_type: DWORD,
-    pub start_type: DWORD,
-    pub error_control: DWORD,
-    pub tag_id: DWORD,
+    pub desired_access: u32,
+    pub service_type: ENUM_SERVICE_TYPE,
+    pub start_type: SERVICE_START_TYPE,
+    pub error_control: SERVICE_ERROR,
+    pub tag_id: u32,
     pub load_order_group: String,
     pub dependencies: String,
     pub account_name: String,
     pub password: String,
     pub service_status: SERVICE_STATUS,
     pub status_handle: SERVICE_STATUS_HANDLE,
-    pub controls_accepted: DWORD,
+    pub controls_accepted: u32,
 }
 
 impl ControllerInterface for WindowsController {
@@ -118,21 +128,21 @@ impl ControllerInterface for WindowsController {
 
             let service = CreateServiceW(
                 service_manager.handle,
-                get_utf16(self.service_name.as_str()).as_ptr(),
-                get_utf16(self.display_name.as_str()).as_ptr(),
+                PCWSTR(get_utf16(self.service_name.as_str()).as_ptr()),
+                PCWSTR(get_utf16(self.display_name.as_str()).as_ptr()),
                 self.desired_access,
                 self.service_type,
                 self.start_type,
                 self.error_control,
-                get_utf16(filename.as_str()).as_ptr(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-            );
+                PCWSTR(get_utf16(filename.as_str()).as_ptr()),
+                PCWSTR::null(),
+                None,
+                PCWSTR::null(),
+                PCWSTR::null(),
+                PCWSTR::null(),
+            )?;
 
-            if service.is_null() {
+            if service.is_invalid() {
                 return Err(Error::new(&format!(
                     "CreateService: {}",
                     get_last_error_text()
@@ -143,12 +153,12 @@ impl ControllerInterface for WindowsController {
 
             let mut description = get_utf16(self.description.as_str());
 
-            let mut sd = SERVICE_DESCRIPTION_W {
-                lpDescription: description.as_mut_ptr(),
+            let mut sd = SERVICE_DESCRIPTIONW {
+                lpDescription: PWSTR(description.as_mut_ptr()),
             };
 
-            let p_sd = &mut sd as *mut _ as *mut winapi::ctypes::c_void;
-            ChangeServiceConfig2W(service, SERVICE_CONFIG_DESCRIPTION, p_sd);
+            let p_sd = &mut sd as *mut _ as *mut c_void;
+            ChangeServiceConfig2W(service, SERVICE_CONFIG_DESCRIPTION, Some(p_sd));
             CloseServiceHandle(service);
 
             Ok(())
@@ -164,9 +174,9 @@ impl ControllerInterface for WindowsController {
                 service.handle,
                 SERVICE_CONTROL_STOP,
                 &mut self.service_status,
-            ) != 0
+            ).as_bool()
             {
-                while QueryServiceStatus(service.handle, &mut self.service_status) != 0 {
+                while QueryServiceStatus(service.handle, &mut self.service_status).as_bool() {
                     if self.service_status.dwCurrentState != SERVICE_STOP_PENDING {
                         break;
                     }
@@ -174,7 +184,7 @@ impl ControllerInterface for WindowsController {
                 }
             }
 
-            if DeleteService(service.handle) == 0 {
+            if !DeleteService(service.handle).as_bool() {
                 return Err(Error::new(&format!(
                     "DeleteService: {}",
                     get_last_error_text()
@@ -190,8 +200,8 @@ impl ControllerInterface for WindowsController {
             let service_manager = ServiceControlManager::open(SC_MANAGER_ALL_ACCESS)?;
             let service = service_manager.open_service(&self.service_name, SERVICE_ALL_ACCESS)?;
 
-            if StartServiceW(service.handle, 0, ptr::null_mut()) != 0 {
-                while QueryServiceStatus(service.handle, &mut self.service_status) != 0 {
+            if StartServiceW(service.handle, None).as_bool() {
+                while QueryServiceStatus(service.handle, &mut self.service_status).as_bool() {
                     if self.service_status.dwCurrentState != SERVICE_START_PENDING {
                         break;
                     }
@@ -212,20 +222,20 @@ impl ControllerInterface for WindowsController {
             let service_manager = ServiceControlManager::open(SC_MANAGER_ALL_ACCESS)?;
             let service = service_manager.open_service(&self.service_name, SERVICE_ALL_ACCESS)?;
 
-            if ControlService(
+            if !ControlService(
                 service.handle,
                 SERVICE_CONTROL_STOP,
                 &mut self.service_status,
-            ) != 0
+            ).as_bool()
             {
-                while QueryServiceStatus(service.handle, &mut self.service_status) != 0 {
-                    if self.service_status.dwCurrentState != SERVICE_STOP_PENDING {
-                        break;
-                    }
-                    thread::sleep(time::Duration::from_millis(250));
-                }
-            } else {
                 return Err(Error::new("ControlService: failed to stop service"));
+            }
+
+            while QueryServiceStatus(service.handle, &mut self.service_status).as_bool() {
+                if self.service_status.dwCurrentState != SERVICE_STOP_PENDING {
+                    break;
+                }
+                thread::sleep(time::Duration::from_millis(250));
             }
 
             if self.service_status.dwCurrentState != SERVICE_STOPPED {
@@ -261,7 +271,7 @@ impl WindowsController {
                 dwCheckPoint: 0,
                 dwWaitHint: 0,
             },
-            status_handle: ptr::null_mut(),
+            status_handle: SERVICE_STATUS_HANDLE::default(),
             controls_accepted: SERVICE_ACCEPT_STOP,
         }
     }
@@ -272,17 +282,17 @@ impl WindowsController {
         service_main_wrapper: WindowsServiceMainWrapperFn,
     ) -> Result<(), Error> {
         unsafe {
-            let service_name = get_utf16(self.service_name.as_str());
+            let mut service_name = get_utf16(self.service_name.as_str());
 
             let service_table: &[*const SERVICE_TABLE_ENTRYW] = &[
                 &SERVICE_TABLE_ENTRYW {
-                    lpServiceName: service_name.as_ptr(),
+                    lpServiceName: PWSTR(service_name.as_mut_ptr()),
                     lpServiceProc: Some(service_main_wrapper),
                 },
                 ptr::null(),
             ];
 
-            match StartServiceCtrlDispatcherW(*service_table.as_ptr()) {
+            match StartServiceCtrlDispatcherW(*service_table.as_ptr()).0 {
                 0 => Err(Error::new("StartServiceCtrlDispatcher")),
                 _ => Ok(()),
             }
@@ -292,16 +302,16 @@ impl WindowsController {
 
 fn set_service_status(
     status_handle: SERVICE_STATUS_HANDLE,
-    current_state: DWORD,
-    wait_hint: DWORD,
+    current_state: SERVICE_STATUS_CURRENT_STATE,
+    wait_hint: u32,
+    accepted_controls: Option<u32>,
 ) {
     let mut service_status = SERVICE_STATUS {
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
         dwCurrentState: current_state,
-        dwControlsAccepted: SERVICE_ACCEPT_STOP
-            | SERVICE_ACCEPT_SHUTDOWN
-            | SERVICE_ACCEPT_PAUSE_CONTINUE
-            | SERVICE_ACCEPT_SESSIONCHANGE,
+        dwControlsAccepted: accepted_controls.unwrap_or(
+            SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_SESSIONCHANGE,
+        ),
         dwWin32ExitCode: 0,
         dwServiceSpecificExitCode: 0,
         dwCheckPoint: 0,
@@ -313,16 +323,16 @@ fn set_service_status(
 }
 
 unsafe extern "system" fn service_handler<T>(
-    control: DWORD,
-    event_type: DWORD,
-    event_data: LPVOID,
-    context: LPVOID,
-) -> DWORD {
+    control: u32,
+    event_type: u32,
+    event_data: *mut ffi::c_void,
+    context: *mut ffi::c_void,
+) -> u32 {
     let tx = context as *mut mpsc::Sender<ServiceEvent<T>>;
 
     match control {
         SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
-            set_service_status(SERVICE_CONTROL_HANDLE, SERVICE_STOP_PENDING, 10);
+            set_service_status(SERVICE_CONTROL_HANDLE, SERVICE_STOP_PENDING, 10, None);
             let _ = (*tx).send(ServiceEvent::Stop);
             0
         }
@@ -335,49 +345,48 @@ unsafe extern "system" fn service_handler<T>(
             0
         }
         SERVICE_CONTROL_SESSIONCHANGE => {
-            let event = event_type as usize;
-            let session_notification = event_data as PWTSSESSION_NOTIFICATION;
+            let session_notification = event_data as *const WTSSESSION_NOTIFICATION;
             let session_id = (*session_notification).dwSessionId;
             let session = Session::new(session_id);
 
-            if event == WTS_CONSOLE_CONNECT {
+            if event_type == WTS_CONSOLE_CONNECT {
                 let _ = (*tx).send(ServiceEvent::SessionConnect(session));
                 0
-            } else if event == WTS_CONSOLE_DISCONNECT {
+            } else if event_type == WTS_CONSOLE_DISCONNECT {
                 let _ = (*tx).send(ServiceEvent::SessionDisconnect(session));
                 0
-            } else if event == WTS_REMOTE_CONNECT {
+            } else if event_type == WTS_REMOTE_CONNECT {
                 let _ = (*tx).send(ServiceEvent::SessionRemoteConnect(session));
                 0
-            } else if event == WTS_REMOTE_DISCONNECT {
+            } else if event_type == WTS_REMOTE_DISCONNECT {
                 let _ = (*tx).send(ServiceEvent::SessionRemoteDisconnect(session));
                 0
-            } else if event == WTS_SESSION_LOGON {
+            } else if event_type == WTS_SESSION_LOGON {
                 let _ = (*tx).send(ServiceEvent::SessionLogon(session));
                 0
-            } else if event == WTS_SESSION_LOGOFF {
+            } else if event_type == WTS_SESSION_LOGOFF {
                 let _ = (*tx).send(ServiceEvent::SessionLogoff(session));
                 0
-            } else if event == WTS_SESSION_LOCK {
+            } else if event_type == WTS_SESSION_LOCK {
                 let _ = (*tx).send(ServiceEvent::SessionLock(session));
                 0
-            } else if event == WTS_SESSION_UNLOCK {
+            } else if event_type == WTS_SESSION_UNLOCK {
                 let _ = (*tx).send(ServiceEvent::SessionUnlock(session));
                 0
             } else {
                 0
             }
         }
-        _ => ERROR_CALL_NOT_IMPLEMENTED,
+        _ => ERROR_CALL_NOT_IMPLEMENTED.0,
     }
 }
 
-fn get_args(argc: DWORD, argv: *mut LPWSTR) -> Vec<String> {
+fn get_args(argc: u32, argv: *mut PWSTR) -> Vec<String> {
     let mut args = Vec::new();
     for i in 0..argc {
         unsafe {
             let s = *argv.add(i as usize);
-            let widestr = WideCString::from_ptr_str(s);
+            let widestr = WideCString::from_raw(s.as_ptr());
             args.push(widestr.to_string_lossy());
         }
     }
@@ -390,11 +399,10 @@ pub fn get_utf16(value: &str) -> Vec<u16> {
 
 pub fn get_filename() -> String {
     unsafe {
-        let mut filename = [0u16; MAX_PATH];
+        let mut filename = [0u16; MAX_PATH as usize];
         let _size = GetModuleFileNameW(
-            ptr::null_mut(),
-            filename.as_mut_ptr(),
-            filename.len() as DWORD,
+            None,
+            filename.as_mut(),
         );
         String::from_utf16(&filename).unwrap_or_else(|_| String::from(""))
     }
@@ -408,7 +416,7 @@ pub fn get_last_error_text() -> String {
             ptr::null(),
             GetLastError(),
             0,
-            message.as_mut_ptr(),
+            PWSTR(message.as_mut_ptr()),
             message.len() as u32,
             ptr::null_mut(),
         );
@@ -420,31 +428,34 @@ pub fn get_last_error_text() -> String {
 #[macro_export]
 macro_rules! Service {
     ($name:expr, $function:ident) => {
-        use $crate::winapi::shared::minwindef::DWORD;
-        use $crate::winapi::um::winnt::LPWSTR;
+        use $crate::windows::core::PWSTR;
 
-        extern "system" fn service_main_wrapper(argc: DWORD, argv: *mut LPWSTR) {
-            dispatch($function, $name, argc, argv);
+        extern "system" fn service_main_wrapper(argc: u32, argv: *mut PWSTR) {
+            if let Err(error) = dispatch($function, $name, argc, argv) {
+                // The service will properly abort if an error is raised
+                panic!("{error}")
+            };
         }
     };
 }
 
 #[doc(hidden)]
-pub fn dispatch<T>(service_main: ServiceMainFn<T>, name: &str, argc: DWORD, argv: *mut LPWSTR) {
+pub fn dispatch<T>(service_main: ServiceMainFn<T>, name: &str, argc: u32, argv: *mut PWSTR) -> Result<(), Error> {
     let args = get_args(argc, argv);
     let service_name = get_utf16(name);
-    let (mut tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::channel();
     let _tx = tx.clone();
     let ctrl_handle = unsafe {
         RegisterServiceCtrlHandlerExW(
-            service_name.as_ptr(),
+            Some(&PCWSTR(service_name.as_ptr())),
             Some(service_handler::<T>),
-            &mut tx as *mut _ as LPVOID,
-        )
+            Some(&tx as *const _ as *const ffi::c_void),
+        )?
     };
     unsafe { SERVICE_CONTROL_HANDLE = ctrl_handle };
-    set_service_status(ctrl_handle, SERVICE_START_PENDING, 0);
-    set_service_status(ctrl_handle, SERVICE_RUNNING, 0);
+    set_service_status(ctrl_handle, SERVICE_START_PENDING, 0, None);
+    set_service_status(ctrl_handle, SERVICE_RUNNING, 0, None);
     service_main(rx, _tx, args, false);
-    set_service_status(ctrl_handle, SERVICE_STOPPED, 0);
+    set_service_status(ctrl_handle, SERVICE_STOPPED, 0, None);
+    Ok(())
 }
