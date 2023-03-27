@@ -14,12 +14,12 @@ use log4rs::append::file::FileAppender;
 use log4rs::config::{Appender, Config, Root};
 use log4rs::encode::pattern::PatternEncoder;
 
-static SERVICE_NAME: &'static str = "foobar";
-static DISPLAY_NAME: &'static str = "FooBar Service";
-static DESCRIPTION: &'static str = "This is the FooBar service";
+static SERVICE_NAME: &str = "foobar";
+static DISPLAY_NAME: &str = "FooBar Service";
+static DESCRIPTION: &str = "This is the FooBar service";
 
 #[cfg(windows)]
-const LOG_PATH: &'static str = "C:\\Windows\\Temp\\foobar.log";
+const LOG_PATH: &str = "C:\\Windows\\Temp\\foobar.log";
 #[cfg(any(unix, target_os = "macos"))]
 const LOG_PATH: &'static str = "/tmp/foobar.log";
 
@@ -70,10 +70,7 @@ fn my_service_main(
     loop {
         if let Ok(control_code) = rx.recv() {
             info!("Received control code: {}", control_code);
-            match control_code {
-                ServiceEvent::Stop => break,
-                _ => (),
-            }
+            if let ServiceEvent::Stop = control_code { break }
         }
     }
 

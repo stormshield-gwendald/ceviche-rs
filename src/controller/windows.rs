@@ -10,13 +10,14 @@ use windows::core::{PCWSTR, PWSTR};
 use windows::imp::{FormatMessageW, GetLastError, FORMAT_MESSAGE_FROM_SYSTEM};
 use windows::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, MAX_PATH};
 use windows::Win32::Security::SC_HANDLE;
+use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
+use windows::Win32::System::RemoteDesktop::WTSSESSION_NOTIFICATION;
 use windows::Win32::System::Services::{
     ChangeServiceConfig2W, CloseServiceHandle, ControlService, CreateServiceW, DeleteService,
     OpenSCManagerW, OpenServiceW, QueryServiceStatus, RegisterServiceCtrlHandlerExW,
     SetServiceStatus, StartServiceCtrlDispatcherW, StartServiceW, ENUM_SERVICE_TYPE,
-    SC_MANAGER_ALL_ACCESS, SERVICE_ACCEPT_SESSIONCHANGE,
-    SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
-    SERVICE_CONFIG_DESCRIPTION, SERVICE_CONTROL_CONTINUE, SERVICE_CONTROL_PAUSE,
+    SC_MANAGER_ALL_ACCESS, SERVICE_ACCEPT_SESSIONCHANGE, SERVICE_ACCEPT_SHUTDOWN,
+    SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CONFIG_DESCRIPTION,
     SERVICE_CONTROL_SESSIONCHANGE, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP,
     SERVICE_DESCRIPTIONW, SERVICE_ERROR, SERVICE_ERROR_NORMAL, SERVICE_RUNNING,
     SERVICE_START_PENDING, SERVICE_START_TYPE, SERVICE_STATUS, SERVICE_STATUS_CURRENT_STATE,
@@ -27,8 +28,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WTS_CONSOLE_CONNECT, WTS_CONSOLE_DISCONNECT, WTS_REMOTE_CONNECT, WTS_REMOTE_DISCONNECT,
     WTS_SESSION_LOCK, WTS_SESSION_LOGOFF, WTS_SESSION_LOGON, WTS_SESSION_UNLOCK,
 };
-use windows::Win32::System::RemoteDesktop::WTSSESSION_NOTIFICATION;
-use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 
 use crate::controller::{ControllerInterface, ServiceMainFn};
 use crate::session;
@@ -174,7 +173,8 @@ impl ControllerInterface for WindowsController {
                 service.handle,
                 SERVICE_CONTROL_STOP,
                 &mut self.service_status,
-            ).as_bool()
+            )
+            .as_bool()
             {
                 while QueryServiceStatus(service.handle, &mut self.service_status).as_bool() {
                     if self.service_status.dwCurrentState != SERVICE_STOP_PENDING {
@@ -226,7 +226,8 @@ impl ControllerInterface for WindowsController {
                 service.handle,
                 SERVICE_CONTROL_STOP,
                 &mut self.service_status,
-            ).as_bool()
+            )
+            .as_bool()
             {
                 return Err(Error::new("ControlService: failed to stop service"));
             }
@@ -304,21 +305,20 @@ fn set_service_status(
     status_handle: SERVICE_STATUS_HANDLE,
     current_state: SERVICE_STATUS_CURRENT_STATE,
     wait_hint: u32,
-    accepted_controls: Option<u32>,
 ) {
-    let mut service_status = SERVICE_STATUS {
+    let service_status = SERVICE_STATUS {
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
         dwCurrentState: current_state,
-        dwControlsAccepted: accepted_controls.unwrap_or(
-            SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_SESSIONCHANGE,
-        ),
+        dwControlsAccepted: SERVICE_ACCEPT_STOP
+            | SERVICE_ACCEPT_SHUTDOWN
+            | SERVICE_ACCEPT_SESSIONCHANGE,
         dwWin32ExitCode: 0,
         dwServiceSpecificExitCode: 0,
         dwCheckPoint: 0,
         dwWaitHint: wait_hint,
     };
     unsafe {
-        SetServiceStatus(status_handle, &mut service_status);
+        SetServiceStatus(status_handle, &service_status);
     }
 }
 
@@ -332,16 +332,8 @@ unsafe extern "system" fn service_handler<T>(
 
     match control {
         SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
-            set_service_status(SERVICE_CONTROL_HANDLE, SERVICE_STOP_PENDING, 10, None);
+            set_service_status(SERVICE_CONTROL_HANDLE, SERVICE_STOP_PENDING, 10);
             let _ = (*tx).send(ServiceEvent::Stop);
-            0
-        }
-        SERVICE_CONTROL_PAUSE => {
-            let _ = (*tx).send(ServiceEvent::Pause);
-            0
-        }
-        SERVICE_CONTROL_CONTINUE => {
-            let _ = (*tx).send(ServiceEvent::Continue);
             0
         }
         SERVICE_CONTROL_SESSIONCHANGE => {
@@ -386,7 +378,7 @@ fn get_args(argc: u32, argv: *mut PWSTR) -> Vec<String> {
     for i in 0..argc {
         unsafe {
             let s = *argv.add(i as usize);
-            let widestr = WideCString::from_raw(s.as_ptr());
+            let widestr = WideCString::from_ptr_str(s.as_ptr());
             args.push(widestr.to_string_lossy());
         }
     }
@@ -400,10 +392,7 @@ pub fn get_utf16(value: &str) -> Vec<u16> {
 pub fn get_filename() -> String {
     unsafe {
         let mut filename = [0u16; MAX_PATH as usize];
-        let _size = GetModuleFileNameW(
-            None,
-            filename.as_mut(),
-        );
+        let _size = GetModuleFileNameW(None, filename.as_mut());
         String::from_utf16(&filename).unwrap_or_else(|_| String::from(""))
     }
 }
@@ -440,7 +429,12 @@ macro_rules! Service {
 }
 
 #[doc(hidden)]
-pub fn dispatch<T>(service_main: ServiceMainFn<T>, name: &str, argc: u32, argv: *mut PWSTR) -> Result<(), Error> {
+pub fn dispatch<T>(
+    service_main: ServiceMainFn<T>,
+    name: &str,
+    argc: u32,
+    argv: *mut PWSTR,
+) -> Result<(), Error> {
     let args = get_args(argc, argv);
     let service_name = get_utf16(name);
     let (tx, rx) = mpsc::channel();
@@ -453,9 +447,9 @@ pub fn dispatch<T>(service_main: ServiceMainFn<T>, name: &str, argc: u32, argv: 
         )?
     };
     unsafe { SERVICE_CONTROL_HANDLE = ctrl_handle };
-    set_service_status(ctrl_handle, SERVICE_START_PENDING, 0, None);
-    set_service_status(ctrl_handle, SERVICE_RUNNING, 0, None);
+    set_service_status(ctrl_handle, SERVICE_START_PENDING, 0);
+    set_service_status(ctrl_handle, SERVICE_RUNNING, 0);
     service_main(rx, _tx, args, false);
-    set_service_status(ctrl_handle, SERVICE_STOPPED, 0, None);
+    set_service_status(ctrl_handle, SERVICE_STOPPED, 0);
     Ok(())
 }
